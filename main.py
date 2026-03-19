@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import logging
 import threading
+import asyncio
+import urllib.request
+import json as _json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
@@ -22,6 +25,22 @@ logger = logging.getLogger(__name__)
 (ADMIN_MENU, ADMIN_BAN_INPUT, ADMIN_UNBAN_INPUT,
  ADMIN_IBAN_INPUT, ADMIN_FEES_SELECT, ADMIN_FEES_INPUT,
  ADMIN_BROADCAST_INPUT) = range(10, 17)
+
+TICKET_INPUT = 20
+ADMIN_TICKET_REPLY = 21
+
+async def get_ltc_price() -> float:
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=eur"
+        loop = asyncio.get_event_loop()
+        def fetch():
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return _json.loads(r.read())
+        result = await loop.run_in_executor(None, fetch)
+        return float(result["litecoin"]["eur"])
+    except Exception as e:
+        logger.warning(f"LTC Preis konnte nicht abgerufen werden: {e}")
+        return 0.0
 
 def calc_payout(amount, method):
     fees = data.get_fees()
@@ -60,6 +79,8 @@ async def start(update, ctx):
         [InlineKeyboardButton("💱 Exchange starten", callback_data="start_exchange")],
         [InlineKeyboardButton("📋 Meine LTC Adresse", callback_data="my_address")],
         [InlineKeyboardButton("ℹ️ Über uns", callback_data="about")],
+        [InlineKeyboardButton("🎫 Support Ticket", callback_data="open_ticket"),
+         InlineKeyboardButton("🆘 Support", url="https://t.me/AcksonSupportBot")],
     ]
     await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN,
                                     reply_markup=InlineKeyboardMarkup(keyboard))
@@ -71,7 +92,23 @@ async def menu_handler(update, ctx):
     d = query.data
     fees = data.get_fees()
 
-    if d == "start_exchange":
+    if d == "open_ticket":
+        user = query.from_user
+        if data.is_banned(user.id):
+            await query.answer("🚫 Du wurdest gesperrt.", show_alert=True)
+            return STATE_MENU
+        await query.edit_message_text(
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🎫 *SUPPORT TICKET*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Beschreibe dein Problem oder deine Frage.\n"
+            "Wir melden uns so schnell wie möglich!\n\n"
+            "_Einfach Nachricht schreiben und senden:_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Abbrechen", callback_data="main_menu")]]))
+        ctx.user_data["awaiting_ticket"] = True
+        return STATE_MENU
+    elif d == "start_exchange":
         return await ask_method(update, ctx)
     elif d == "my_address":
         saved = ctx.user_data.get("ltc_address")
@@ -177,16 +214,25 @@ async def amount_entered(update, ctx):
     ctx.user_data["amount"] = amount
     ctx.user_data["payout_eur"] = payout
 
+    ltc_price = await get_ltc_price()
+    ltc_amount = round(payout / ltc_price, 6) if ltc_price > 0 else None
+    ctx.user_data["ltc_price"] = ltc_price
+
     saved_address = ctx.user_data.get("ltc_address")
     keyboard_rows = []
     if saved_address:
         keyboard_rows.append([InlineKeyboardButton("✅ Gespeicherte Adresse verwenden", callback_data="use_saved_address")])
     keyboard_rows.append([InlineKeyboardButton("❌ Abbrechen", callback_data="main_menu")])
 
+    ltc_line = f"🪙 Du erhältst: *≈ {ltc_amount:.6f} LTC*\n" if ltc_amount else ""
+    price_line = f"📈 LTC Kurs: *1 LTC = {ltc_price:.2f} €*\n" if ltc_price > 0 else ""
+
     text = (
         f"💶 Betrag: *{amount:.2f} €*\n"
         f"📊 Gebühr ({int(fees[method]*100)}%): *{amount - payout:.2f} €*\n"
-        f"💎 Du erhältst: *≈ {payout:.2f} € in LTC*\n\n"
+        f"💎 Auszahlung: *{payout:.2f} €*\n"
+        f"{ltc_line}"
+        f"{price_line}\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n📤 *LTC Auszahlungsadresse*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "Sende mir deine *Litecoin Adresse:*"
     )
@@ -231,12 +277,18 @@ async def show_confirmation(update, ctx):
     amount = d["amount"]
     payout = d["payout_eur"]
     address = d["ltc_address_order"]
+    ltc_price = d.get("ltc_price", 0.0)
+    ltc_amount = round(payout / ltc_price, 6) if ltc_price > 0 else None
+    ltc_line = f"🪙 LTC Betrag:     *≈ {ltc_amount:.6f} LTC*\n" if ltc_amount else ""
+    price_line = f"📈 LTC Kurs:        *1 LTC = {ltc_price:.2f} €*\n" if ltc_price > 0 else ""
     text = (
         "━━━━━━━━━━━━━━━━━━━━━━\n📋 *AUFTRAGSÜBERSICHT*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"💳 Methode:         *{method_label(method)}*\n"
         f"💶 Betrag:            *{amount:.2f} €*\n"
         f"📊 Gebühr ({int(fees[method]*100)}%):  *{amount - payout:.2f} €*\n"
-        f"💎 Auszahlung:    *≈ {payout:.2f} € in LTC*\n\n"
+        f"💎 Auszahlung:    *{payout:.2f} €*\n"
+        f"{ltc_line}"
+        f"{price_line}\n"
         f"📤 LTC Adresse:\n`{address}`\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n⚠️ *Bitte überprüfe alle Angaben!*"
     )
@@ -264,6 +316,10 @@ async def confirm_order(update, ctx):
     address = d["ltc_address_order"]
     order_id = f"UE{user.id}{int(amount*100)}"
 
+    ltc_price = d.get("ltc_price", 0.0)
+    ltc_amount = round(payout / ltc_price, 6) if ltc_price > 0 else None
+    ltc_line = f"🪙 LTC Betrag: *≈ {ltc_amount:.6f} LTC*\n" if ltc_amount else ""
+    price_line = f"📈 LTC Kurs: *1 LTC = {ltc_price:.2f} €*\n" if ltc_price > 0 else ""
     admin_text = (
         "🔔 *NEUE EXCHANGE ANFRAGE*\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🆔 Order ID: `{order_id}`\n"
@@ -272,7 +328,9 @@ async def confirm_order(update, ctx):
         f"💳 Methode: *{method_label(method)}*\n"
         f"💶 Betrag: *{amount:.2f} €*\n"
         f"📊 Gebühr ({int(fees[method]*100)}%): *{amount - payout:.2f} €*\n"
-        f"💎 Auszahlung: *≈ {payout:.2f} € in LTC*\n\n"
+        f"💎 Auszahlung: *{payout:.2f} €*\n"
+        f"{ltc_line}"
+        f"{price_line}\n"
         f"📤 LTC Adresse:\n`{address}`\n\n━━━━━━━━━━━━━━━━━━━━━━"
     )
     admin_keyboard = InlineKeyboardMarkup([[
@@ -390,6 +448,8 @@ async def back_to_main(update, ctx):
         [InlineKeyboardButton("💱 Exchange starten", callback_data="start_exchange")],
         [InlineKeyboardButton("📋 Meine LTC Adresse", callback_data="my_address")],
         [InlineKeyboardButton("ℹ️ Über uns", callback_data="about")],
+        [InlineKeyboardButton("🎫 Support Ticket", callback_data="open_ticket"),
+         InlineKeyboardButton("🆘 Support", url="https://t.me/AcksonSupportBot")],
     ]
     text = (
         "┌─────────────────────────────────┐\n"
@@ -408,6 +468,116 @@ async def back_to_main(update, ctx):
 
 async def cancel(update, ctx):
     await update.message.reply_text("❌ Abgebrochen. /start zum Neustart.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────
+#            SUPPORT TICKET
+# ─────────────────────────────────────────
+
+async def start_ticket(update, ctx):
+    user = update.effective_user
+    if data.is_banned(user.id):
+        await update.message.reply_text("🚫 Du wurdest vom Bot gesperrt.")
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🎫 *SUPPORT TICKET*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Beschreibe dein Problem oder deine Frage.\n"
+        "Wir melden uns so schnell wie möglich!\n\n"
+        "_Einfach Nachricht schreiben und senden:_",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Abbrechen", callback_data="ticket_cancel")]]))
+    return TICKET_INPUT
+
+async def ticket_cancel_handler(update, ctx):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("❌ Ticket abgebrochen. /start zum Hauptmenü.")
+    return ConversationHandler.END
+
+async def ticket_message_received(update, ctx):
+    user = update.effective_user
+    message = update.message.text.strip()
+    ticket_id = f"T{user.id}{update.message.message_id}"
+
+    admin_text = (
+        "🎫 *NEUES SUPPORT TICKET*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 Ticket ID: `{ticket_id}`\n"
+        f"👤 User: [{user.first_name}](tg://user?id={user.id}) (`{user.id}`)\n"
+        f"🕐 Username: @{user.username or 'N/A'}\n\n"
+        f"💬 *Nachricht:*\n{message}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━"
+    )
+    reply_keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📩 Antworten", callback_data=f"ticket_reply_{user.id}_{ticket_id}")
+    ]])
+
+    for aid in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(aid, admin_text, parse_mode=ParseMode.MARKDOWN,
+                                       reply_markup=reply_keyboard)
+        except Exception as e:
+            logger.error(f"Ticket notification failed for {aid}: {e}")
+
+    await update.message.reply_text(
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ *Ticket gesendet!*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 Deine Ticket ID: `{ticket_id}`\n\n"
+        "Der Admin meldet sich so schnell wie möglich.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Hauptmenü", callback_data="main_menu")]]))
+    return ConversationHandler.END
+
+async def handle_menu_text(update, ctx):
+    if ctx.user_data.get("awaiting_ticket"):
+        ctx.user_data["awaiting_ticket"] = False
+        return await ticket_message_received(update, ctx)
+    return STATE_MENU
+
+async def ticket_reply_callback(update, ctx):
+    query = update.callback_query
+    await query.answer()
+    if update.effective_user.id not in ADMIN_IDS:
+        await query.answer("⛔ Kein Zugriff!", show_alert=True)
+        return ConversationHandler.END
+    parts = query.data.split("_")
+    user_id = int(parts[2])
+    ticket_id = parts[3]
+    ctx.user_data["ticket_reply_to"] = user_id
+    ctx.user_data["ticket_id"] = ticket_id
+    await query.edit_message_text(
+        query.message.text + f"\n\n✏️ *Antwort eingeben:*",
+        parse_mode=ParseMode.MARKDOWN)
+    return ADMIN_TICKET_REPLY
+
+async def ticket_reply_input(update, ctx):
+    if update.effective_user.id not in ADMIN_IDS:
+        return ConversationHandler.END
+    reply_text = update.message.text.strip()
+    user_id = ctx.user_data.get("ticket_reply_to")
+    ticket_id = ctx.user_data.get("ticket_id")
+    if not user_id:
+        await update.message.reply_text("❌ Fehler: Kein Ticket gefunden.")
+        return ConversationHandler.END
+    try:
+        await ctx.bot.send_message(
+            user_id,
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📩 *ANTWORT AUF DEIN TICKET*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"🆔 Ticket ID: `{ticket_id}`\n\n"
+            f"💬 *Admin-Antwort:*\n{reply_text}\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Hauptmenü", callback_data="main_menu")]]))
+        await update.message.reply_text(f"✅ Antwort an User `{user_id}` gesendet!", parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Konnte User nicht erreichen: {e}")
     return ConversationHandler.END
 
 
@@ -642,13 +812,37 @@ def main():
     logger.info("🌐 Keepalive-Server gestartet auf Port 5000")
     app = Application.builder().token(BOT_TOKEN).build()
 
+    ticket_conv = ConversationHandler(
+        entry_points=[CommandHandler("ticket", start_ticket)],
+        states={
+            TICKET_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_message_received),
+                CallbackQueryHandler(ticket_cancel_handler, pattern="^ticket_cancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
+    ticket_reply_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(ticket_reply_callback, pattern="^ticket_reply_")],
+        states={
+            ADMIN_TICKET_REPLY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ticket_reply_input),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+
     user_conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             STATE_MENU: [
-                CallbackQueryHandler(menu_handler, pattern="^(start_exchange|my_address|about|main_menu|change_address)$"),
+                CallbackQueryHandler(menu_handler, pattern="^(open_ticket|start_exchange|my_address|about|main_menu|change_address)$"),
                 CallbackQueryHandler(rate_bot, pattern="^rate_bot$"),
                 CallbackQueryHandler(rating_received, pattern="^rate_[1-5]$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu_text),
             ],
             STATE_SELECT_METHOD: [
                 CallbackQueryHandler(method_selected, pattern="^method_"),
@@ -713,6 +907,8 @@ def main():
     )
 
     app.add_handler(admin_conv)
+    app.add_handler(ticket_reply_conv)
+    app.add_handler(ticket_conv)
     app.add_handler(user_conv)
     app.add_handler(CallbackQueryHandler(admin_decision, pattern="^admin_(accept|reject)_"))
     logger.info("💎 Unclean Exchange Bot gestartet!")
